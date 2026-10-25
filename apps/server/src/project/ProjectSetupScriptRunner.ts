@@ -139,6 +139,17 @@ function stripTerminalControl(text: string): string {
   );
 }
 
+// Line editors (zsh, fish, bash 5.1+) enable bracketed paste when they start reading a command.
+const BRACKETED_PASTE_ON = "\x1b[?2004h";
+const BRACKETED_PASTE_OFF = "\x1b[?2004l";
+const SHELL_QUIET_FALLBACK = "2 seconds";
+
+function lineEditorReading(text: string, previous: boolean): boolean {
+  const on = text.lastIndexOf(BRACKETED_PASTE_ON);
+  const off = text.lastIndexOf(BRACKETED_PASTE_OFF);
+  return on === off ? previous : on > off;
+}
+
 type CompletionShell = "posix" | "fish" | "powershell";
 
 function resolveCompletionShell(
@@ -267,6 +278,47 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  // Input typed during shell startup can be read by an rc-file prompt (fnm, nvm) instead of the
+  // shell, which loses the command. Wait for the line editor, or for a quiet shell without one.
+  const awaitShellReady = Effect.fn("ProjectSetupScriptRunner.awaitShellReady")(function* (input: {
+    readonly threadId: string;
+    readonly terminalId: string;
+    readonly history: string;
+  }) {
+    if (lineEditorReading(input.history, false)) return;
+    const ready = yield* Deferred.make<void>();
+    let reading = false;
+    let carry = "";
+    let busy = false;
+    let activity = 0;
+    const unsubscribe = yield* terminalManager.subscribe((event) => {
+      if (event.threadId !== input.threadId || event.terminalId !== input.terminalId) {
+        return Effect.void;
+      }
+      activity += 1;
+      if (event.type === "activity") busy = event.hasRunningSubprocess;
+      if (event.type === "output") {
+        const text = carry + event.data;
+        carry = text.slice(-(BRACKETED_PASTE_ON.length - 1));
+        reading = lineEditorReading(text, reading);
+      }
+      const done = reading || event.type === "exited" || event.type === "closed";
+      return done ? Deferred.succeed(ready, undefined).pipe(Effect.asVoid) : Effect.void;
+    });
+    // A startup prompt runs as a child process, so a busy shell keeps waiting for the user.
+    const quiet = Effect.gen(function* () {
+      while (true) {
+        const seen = activity;
+        yield* Effect.sleep(SHELL_QUIET_FALLBACK);
+        if (activity === seen && !busy) return;
+      }
+    });
+    yield* Deferred.await(ready).pipe(
+      Effect.raceFirst(quiet),
+      Effect.ensuring(Effect.sync(() => unsubscribe())),
+    );
+  });
+
   const runForThread: ProjectSetupScriptRunner["Service"]["runForThread"] = Effect.fn(
     "ProjectSetupScriptRunner.runForThread",
   )(function* (input) {
@@ -361,7 +413,7 @@ export const make = Effect.gen(function* () {
           )
         : script.command;
 
-    yield* terminalManager
+    const terminal = yield* terminalManager
       .open({
         threadId: input.threadId,
         terminalId,
@@ -392,23 +444,29 @@ export const make = Effect.gen(function* () {
           })
         : undefined;
 
-    yield* terminalManager
-      .write({
-        threadId: input.threadId,
-        terminalId,
-        data: projectScriptTerminalInput(commandLine),
-      })
-      .pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProjectSetupScriptOperationError({
-              ...errorContext,
-              operation: "writeCommand",
-              cause,
-            }),
-        ),
-        Effect.tapError(() => Effect.sync(() => observed?.unsubscribe())),
-      );
+    // PowerShell has no line-editor signal; keep its immediate write.
+    yield* (
+      completionShell === "powershell"
+        ? Effect.void
+        : awaitShellReady({ threadId: input.threadId, terminalId, history: terminal.history })
+    ).pipe(
+      Effect.andThen(
+        terminalManager.write({
+          threadId: input.threadId,
+          terminalId,
+          data: projectScriptTerminalInput(commandLine),
+        }),
+      ),
+      Effect.mapError(
+        (cause) =>
+          new ProjectSetupScriptOperationError({
+            ...errorContext,
+            operation: "writeCommand",
+            cause,
+          }),
+      ),
+      Effect.onError(() => Effect.sync(() => observed?.unsubscribe())),
+    );
 
     const completion = observed?.completion.pipe(
       Effect.tap(({ exitCode }) =>
